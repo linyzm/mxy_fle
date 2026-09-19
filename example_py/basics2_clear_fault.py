@@ -30,7 +30,7 @@ def main():
     # Print description
     logger.info(
         ">>> Tutorial description <<<\nThis tutorial clears minor or critical faults, if any, of "
-        "the connected robot.\n"
+       "the connected robot.\n"
     )
 
     try:

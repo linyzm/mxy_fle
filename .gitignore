@@ -10,3 +10,15 @@ build*/
 cloned/
 html/
 __pycache__
+
+# Local dependency checkout and in-source CMake build artifacts
+/third_party/
+/thirdparty/CMakeCache.txt
+/thirdparty/CMakeFiles/
+/thirdparty/CPackConfig.cmake
+/thirdparty/CPackSourceConfig.cmake
+/thirdparty/Makefile
+/thirdparty/cmake_install.cmake
+/thirdparty/flexiv_rdk-config-version.cmake
+/thirdparty/flexiv_rdk-config.cmake
+/thirdparty/install_manifest.txt
