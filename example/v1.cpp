@@ -39,13 +39,6 @@ constexpr double kD = 200.0;
 constexpr double kKp = 0.5;//0.5
 constexpr double kKi = 1.0;
 
-// ===================== 导纳安全限幅 =====================
-constexpr double kMaxOffsetZ = 5;       // 最大位置修正 5 cm
-constexpr double kMaxVelocityZ = 0.5;    // 最大修正速度 5 mm/s
-constexpr double kMaxForceInt = 10.0;      // 积分限幅
-//滤波
-constexpr double kForceFilterAlpha = 0.95;
-
 // ===================== 力方向修正 =====================
 // 如果发现力越大机器人越往里压，把 1.0 改成 -1.0
 constexpr double kForceSignZ = 1.0;
@@ -108,15 +101,12 @@ public:
         double force_error = measured_force - desired_force;
 
         force_error_int_ += force_error * kDt;
-        force_error_int_ = std::clamp(force_error_int_, -kMaxForceInt, kMaxForceInt);
 
         double acc = (kKp * force_error + kKi * force_error_int_ - kD * velocity_) / kM;
 
         velocity_ += acc * kDt;
-        velocity_ = std::clamp(velocity_, -kMaxVelocityZ, kMaxVelocityZ);
 
         offset_ += velocity_ * kDt;
-        offset_ = std::clamp(offset_, -kMaxOffsetZ, kMaxOffsetZ);
 
         last_force_error_ = force_error;
         last_acc_ = acc;
@@ -219,28 +209,11 @@ void PeriodicTask(
         // ===================== 统一读取 Z 向力 =====================
         const double raw_force_z = robot.states().ext_wrench_in_world[2];
         const double measured_force_z = kForceSignZ * raw_force_z;
-        //不滤波
-        // const double force_error = measured_force_z - kDesiredForceZ;
-
-        // ===================== Z 向力低通滤波 =====================
-        static double filtered_force_z = 0.0;
-        static bool force_filter_initialized = false;
-
-        if (!force_filter_initialized) {
-            filtered_force_z = measured_force_z;
-            force_filter_initialized = true;
-        }
-
-        filtered_force_z =
-            kForceFilterAlpha * filtered_force_z
-            + (1.0 - kForceFilterAlpha) * measured_force_z;
-        // 注意：打印用 raw，控制用 filtered
-        const double force_error = filtered_force_z - kDesiredForceZ;
+        const double force_error = measured_force_z - kDesiredForceZ;
 
         //导出力
         if (log_file.is_open() && loop_counter % kLogInterval == 0) {
-            //log_file << time << "," << measured_force_z << "\n";
-            log_file << time << "," << filtered_force_z << "\n";
+            log_file << time << "," << measured_force_z << "\n";
         }
 
         // ===================== 状态机 =====================
@@ -328,8 +301,7 @@ void PeriodicTask(
             target_pose[1] = last_pose + y_offset;
             last_pose = target_pose[1];
 
-            //const double offset_z = admittance_z.Update(kDesiredForceZ, measured_force_z);
-            const double offset_z = admittance_z.Update(kDesiredForceZ, filtered_force_z);
+            const double offset_z = admittance_z.Update(kDesiredForceZ, measured_force_z);
             // 默认认为：
             // Fz 大于目标时 offset_z 为正，target_pose[2] 增大，机器人退让
             target_pose[2] = final_pose[2] + offset_z;
