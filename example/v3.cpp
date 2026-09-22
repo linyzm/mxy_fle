@@ -1,5 +1,5 @@
 /**
- * Realtime Cartesian PI Admittance Control in Z direction
+ * Realtime Cartesian adaptive variable impedance control in Z direction
  *
  * stage 0: move to pre-contact pose by quintic polynomial
  * stage 1: continue slow downward approach until target force is reached
@@ -35,9 +35,7 @@ constexpr double kDt = 0.001;
 constexpr double kDesiredForceZ = 10.0;
 
 constexpr double kM = 25.0;
-constexpr double kD = 2600.0;//200
-// constexpr double kKp = 0.5;//0.5
-// constexpr double kKi = 1.0;
+constexpr double kD = 2600.0;
 
 
 // ===================== 力方向修正 =====================
@@ -55,10 +53,14 @@ constexpr double kForceReachBand = 0.5;         // Fz >= 目标力 - 0.5 N 就�
 
 // ===================== 硬保护 =====================
 constexpr double kHardStopForceZ = 25.0;
-//自适应参数
-static constexpr double kSigma = 0.00;             // 自适应更新率
+// Duan et al. (2018), Eq. (14) and (30). lambda = kDt = 1 ms.
+constexpr double kSigma = 0.02;
+static_assert(kSigma > 0.0 && kSigma < kDt * kD / (kM + kDt * kD),
+    "Adaptive update rate must satisfy the paper's Eq. (30)");
 
-static constexpr double kVelocityEps = 1e-5;       // 防止 velocity_ 为 0 时除零
+// Fixed contact surface assumption: X_e_dot = X_e_ddot = 0 in Eq. (15).
+constexpr double kEnvironmentVelocityZ = 0.0;
+constexpr double kEnvironmentAccelerationZ = 0.0;
 
 
 // 停止实时任务标志
@@ -94,101 +96,58 @@ void QuinticPolynomial(
 }
 
 /**
- * @brief Z 向 PI 导纳控制器
+ * @brief Duan et al. (2018), Z 向自适应变阻尼导纳控制器
  *
- * ddXc = (Kp * force_error + Ki * force_error_int - D * dXc) / M
- * dXc  = dXc + dt * ddXc
- * Xc   = Xc + dt * dXc
+ * Eq. (14): Phi(t) = Phi(t-lambda) + sigma [Fd(t-lambda)-Fe(t-lambda)] / b
+ * Eq. (15): Xc_ddot = Xe_ddot + [Fe-Fd-(b+Delta_b)(Xc_dot-Xe_dot)] / m
+ * Since Delta_b = b Phi / (Xc_dot-Xe_dot), the damping product is
+ * b * [(Xc_dot-Xe_dot) + Phi]. Calculate this product directly so that
+ * the control law remains defined at zero relative velocity.
  */
 class AdmittanceZ
 {
 public:
-        double Update(double desired_force, double measured_force)
-        {
-            // 论文定义：
-            // ΔF = Fe - Fd
-            const double delta_force = measured_force - desired_force;
+    double Update(double desired_force, double measured_force,
+        double environment_velocity, double environment_acceleration)
+    {
+        const double delta_force = measured_force - desired_force;
+        phi_ += kSigma * (last_desired_force_ - last_measured_force_) / kD;
 
-            // 论文 Eq.(14):
-            // Phi(t) = Phi(t - lambda) + sigma * [Fd(t-lambda) - Fe(t-lambda)] / b
-            //
-            // 注意：这里严格使用上一周期的 force error
-            // Fd - Fe = -ΔF
-            phi_ += kSigma * (last_desired_force_ - last_measured_force_) / kD;
+        const double relative_velocity = velocity_ - environment_velocity;
+        const double acc = environment_acceleration
+            + (delta_force - kD * (relative_velocity + phi_)) / kM;
 
-            // 论文 Eq.(14):
-            // Δb(t) = b / e_dot_hat(t) * Phi(t)
-            //
-            // 在你的代码中，velocity_ 就对应 e_dot_hat 或 Xc_dot - Xe_dot 的近似
-            double delta_b = last_delta_b_;
+        velocity_ += acc * kDt;
+        offset_ += velocity_ * kDt;
 
-            if (std::abs(velocity_) > kVelocityEps) {
-                delta_b = kD * phi_ / velocity_;
-            }
+        last_desired_force_ = desired_force;
+        last_measured_force_ = measured_force;
+        last_force_error_ = delta_force;
+        return offset_;
+    }
 
-            // 工程保护：防止除以很小速度导致 Δb 爆炸
-            // 这不是论文核心律，只是数值保护
-
-            // 论文中的实际阻尼：
-            // B(t) = b + Δb(t)
-            double adaptive_damping = kD + delta_b;
-
-            // 论文 Eq.(15) 简化形式：
-            // Xc_ddot(t) = 1/M * [ΔF(t) - B(t) * Xc_dot(t-1)]
-            //
-            // 这里没有 Xe_dot，因此按 Xe_dot = 0
-            double acc = (delta_force - adaptive_damping * velocity_) / kM;
-
-            velocity_ += acc * kDt;
-
-            offset_ += velocity_ * kDt;
-
-
-            last_desired_force_ = desired_force;
-            last_measured_force_ = measured_force;
-            last_force_error_ = delta_force;
-            last_acc_ = acc;
-            last_delta_b_ = delta_b;
-            last_adaptive_damping_ = adaptive_damping;
-
-            return offset_;
-        }
-
-    void Reset()
+    void Reset(double desired_force, double measured_force, double initial_velocity)
     {
         phi_ = 0.0;
-        last_delta_b_ = 0.0;
-        last_adaptive_damping_ = kD;
-
-        velocity_ = 0.0;
+        velocity_ = initial_velocity;
         offset_ = 0.0;
-
-        last_desired_force_ = kDesiredForceZ;
-        last_measured_force_ = kDesiredForceZ;
-
-        last_force_error_ = 0.0;
-        last_acc_ = 0.0;
+        last_desired_force_ = desired_force;
+        last_measured_force_ = measured_force;
+        last_force_error_ = measured_force - desired_force;
     }
 
     double offset() const { return offset_; }
     double velocity() const { return velocity_; }
     double force_error() const { return last_force_error_; }
     double phi() const { return phi_; }
-    double delta_b() const { return last_delta_b_; }
-    double adaptive_damping() const { return last_adaptive_damping_; }
 private:
-    double phi_ = 0.0;                       // 对应论文 Φ(t)
-    double last_delta_b_ = 0.0;              // 对应论文 Δb(t)
-    double last_adaptive_damping_ = kD;      // 对应论文 B(t)=b+Δb(t)
-
-    double velocity_ = 0.0;                  // 近似 e_dot_hat
-    double offset_ = 0.0;                    // 位置补偿
-
-    double last_desired_force_ = kDesiredForceZ;
-    double last_measured_force_ = kDesiredForceZ;
+    double phi_ = 0.0;
+    double velocity_ = 0.0;  // Previous commanded Xc_dot in Eq. (15)
+    double offset_ = 0.0;    // Xc relative to the Stage 1 contact pose
+    double last_desired_force_ = 0.0;
+    double last_measured_force_ = 0.0;
 
     double last_force_error_ = 0.0;
-    double last_acc_ = 0.0;
 
 };
 
@@ -202,7 +161,7 @@ void PrintHelp()
  *
  * Stage 0: 运动到预接触位置
  * Stage 1: 慢速下降，检测到目标力附近后进入力控
- * Stage 2: Z 向 PI 导纳恒力控制
+ * Stage 2: Z 向自适应变阻尼导纳恒力控制
  */
 void PeriodicTask(
     rdk::Robot& robot,
@@ -316,7 +275,7 @@ void PeriodicTask(
 
             if (target_force_reached || max_approach_reached) {
                 final_pose = target_pose;
-                admittance_z.Reset();
+                admittance_z.Reset(kDesiredForceZ, measured_force_z, -kApproachSpeedZ);
                 stage = ControlStage::ForceControl;
 
                 if (target_force_reached) {
@@ -352,7 +311,8 @@ void PeriodicTask(
 
 
             //z方向导纳控制
-            const double offset_z = admittance_z.Update(kDesiredForceZ, measured_force_z);
+            const double offset_z = admittance_z.Update(kDesiredForceZ,
+                measured_force_z, kEnvironmentVelocityZ, kEnvironmentAccelerationZ);
 
             // 默认认为：
             // Fz 大于目标时 offset_z 为正，target_pose[2] 增大，机器人退让
@@ -366,7 +326,6 @@ void PeriodicTask(
                     " vel_z: {:.6f}, offset_z: {:.6f}, target_z: {:.6f}",
                     measured_force_z,
                     admittance_z.force_error(),
-
                     admittance_z.velocity(),
                     admittance_z.offset(),
                     target_pose[2]);
@@ -423,7 +382,7 @@ int main(int argc, char* argv[])
         ">>> Tutorial description <<<\n"
         "Stage 0: move to pre-contact pose by quintic polynomial.\n"
         "Stage 1: slow approach until target force reached.\n"
-        "Stage 2: start Z-direction PI admittance force control.\n");
+        "Stage 2: start Z-direction adaptive variable impedance control.\n");
 
     bool enable_hold = false;
     if (rdk::utility::ProgramArgsExist(argc, argv, "--hold")) {
@@ -509,7 +468,6 @@ int main(int argc, char* argv[])
 
         log_file.open("force_control_log3.csv");
         log_file << "time,Fz\n";
-        // log_file << "time,Fz,Fd,Ferr,target_y,target_z,vel_z,offset_z,acc_z,dB,B\n";
 
         scheduler.Start();
 
