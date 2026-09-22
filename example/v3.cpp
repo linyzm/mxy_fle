@@ -47,14 +47,15 @@ constexpr double kExtForceThreshold = 30.0;
 constexpr double kExtTorqueThreshold = 5.0;
 
 // ===================== Stage 1 慢速接触参数 =====================
-constexpr double kApproachSpeedZ = 0.003;       // 继续下降速度 1 mm/s
+constexpr double kApproachSpeedZ = 0.003;       // 继续下降速度 3 mm/s
 constexpr double kMaxApproachDistanceZ = 0.05;  // 最多继续下降 5 cm
 constexpr double kForceReachBand = 0.5;         // Fz >= 目标力 - 0.5 N 就进入 stage 2
 
 // ===================== 硬保护 =====================
 constexpr double kHardStopForceZ = 25.0;
 // Duan et al. (2018), Eq. (14) and (30). lambda = kDt = 1 ms.
-constexpr double kSigma = 0.02;
+// Start with slower adaptation while validating the unfiltered, unconstrained law.
+constexpr double kSigma = 0.002;
 static_assert(kSigma > 0.0 && kSigma < kDt * kD / (kM + kDt * kD),
     "Adaptive update rate must satisfy the paper's Eq. (30)");
 
@@ -153,7 +154,7 @@ private:
 
 void PrintHelp()
 {
-    std::cout << "Usage: ./program [robot_sn] [--hold] [--collision]" << std::endl;
+    std::cout << "Usage: ./v3 [robot_sn] [--hold] [--collision] [--scan-y]" << std::endl;
 }
 
 /**
@@ -167,7 +168,8 @@ void PeriodicTask(
     rdk::Robot& robot,
     const std::array<double, rdk::kPoseSize>& init_pose,
     bool enable_hold,
-    bool enable_collision)
+    bool enable_collision,
+    bool enable_scan_y)
 {
     static uint64_t loop_counter = 0;
     static bool initialized = false;
@@ -185,6 +187,9 @@ void PeriodicTask(
     constexpr double kMoveTime = 5.0;
 
     try {
+        if (g_stop_sched.load()) {
+            return;
+        }
         if (robot.fault()) {
             throw std::runtime_error("Robot fault occurred");
         }
@@ -222,8 +227,12 @@ void PeriodicTask(
         const double raw_force_z = robot.states().ext_wrench_in_world[2];
         const double measured_force_z = kForceSignZ * raw_force_z;
         const double force_error = measured_force_z - kDesiredForceZ;
-        if (log_file.is_open() && loop_counter % kLogInterval == 0) {
-            log_file << time << "," << measured_force_z << "\n";
+        if (!std::isfinite(measured_force_z) ||
+            std::fabs(measured_force_z) > kHardStopForceZ) {
+            g_stop_sched = true;
+            robot.Stop();
+            spdlog::error("Invalid or excessive Z force: {:.3f} N; stopping", measured_force_z);
+            return;
         }
 
         // ===================== 状态机 =====================
@@ -273,20 +282,19 @@ void PeriodicTask(
             const bool max_approach_reached
                 = approach_distance >= kMaxApproachDistanceZ;
 
-            if (target_force_reached || max_approach_reached) {
+            if (max_approach_reached && !target_force_reached) {
+                g_stop_sched = true;
+                robot.Stop();
+                spdlog::error("Max approach distance reached without contact force; stopping");
+                return;
+            }
+
+            if (target_force_reached) {
                 final_pose = target_pose;
                 admittance_z.Reset(kDesiredForceZ, measured_force_z, -kApproachSpeedZ);
                 stage = ControlStage::ForceControl;
-
-                if (target_force_reached) {
-                    spdlog::info(
-                        "Target force reached. Enter Stage 2. Fz: {:.3f} N",
-                        measured_force_z);
-                } else {
-                    spdlog::warn(
-                        "Max approach distance reached. Enter Stage 2. Fz: {:.3f} N",
-                        measured_force_z);
-                }
+                spdlog::info("Target force reached. Enter Stage 2. Fz: {:.3f} N",
+                    measured_force_z);
             }
 
             if (loop_counter % kLoopFreq == 0) {
@@ -303,11 +311,12 @@ void PeriodicTask(
         case ControlStage::ForceControl:
         {
             target_pose = final_pose;
-            //y轴移动
-            const double y_speed =0.003;//0.005
-            const double y_offset =y_speed * kDt;
-            target_pose[1] = last_pose + y_offset;
-            last_pose = target_pose[1];
+            // Keep Y fixed for force-loop validation; scan only when explicitly requested.
+            if (enable_scan_y) {
+                constexpr double kScanSpeedY = 0.003;
+                last_pose += kScanSpeedY * kDt;
+            }
+            target_pose[1] = last_pose;
 
 
             //z方向导纳控制
@@ -351,11 +360,19 @@ void PeriodicTask(
                 }
             }
             if (collision_detected) {
+                g_stop_sched = true;
                 robot.Stop();
                 spdlog::warn("Collision detected, stopping robot and exit program ...");
-                g_stop_sched = true;
                 return;
             }
+        }
+
+        if (log_file.is_open() && loop_counter % kLogInterval == 0) {
+            log_file << time << ',' << static_cast<int>(stage) << ','
+                     << measured_force_z << ',' << target_pose[1] << ','
+                     << robot.states().tcp_pose[1] << ',' << target_pose[2] << ','
+                     << robot.states().tcp_pose[2] << ','
+                     << admittance_z.velocity() << ',' << admittance_z.phi() << '\n';
         }
 
         loop_counter++;
@@ -399,6 +416,9 @@ int main(int argc, char* argv[])
     } else {
         spdlog::info("Collision detection disabled");
     }
+
+    const bool enable_scan_y = rdk::utility::ProgramArgsExist(argc, argv, "--scan-y");
+    spdlog::info(enable_scan_y ? "Y scanning enabled" : "Y fixed for force-loop validation");
 
     try {
         rdk::Robot robot(robot_sn);
@@ -461,13 +481,15 @@ int main(int argc, char* argv[])
                 std::ref(robot),
                 std::ref(init_pose),
                 enable_hold,
-                enable_collision),
+                enable_collision,
+                enable_scan_y),
             "HP periodic",
             1,
             scheduler.max_priority());
 
-        log_file.open("force_control_log3.csv");
-        log_file << "time,Fz\n";
+        log_file.open(enable_scan_y ? "force_control_log3_scan.csv"
+                                    : "force_control_log3_static.csv");
+        log_file << "time,stage,Fz,target_y,tcp_y,target_z,tcp_z,admittance_velocity_z,phi\n";
 
         scheduler.Start();
 
