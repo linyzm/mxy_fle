@@ -40,6 +40,7 @@ if(CMAKE_HOST_UNIX)
     v1
     v3
     v5
+    v1_pi_forcechange
   )
 endif()
 
