@@ -38,6 +38,7 @@ if(CMAKE_HOST_UNIX)
     intermediate5_realtime_cartesian_pure_motion_control
     intermediate6_realtime_cartesian_motion_force_control
     v1
+    v1_smc_admittance
     v3
     v5
     v1_pi_forcechange
