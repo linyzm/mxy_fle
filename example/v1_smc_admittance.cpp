@@ -46,7 +46,7 @@ constexpr double kDesiredForceZ = 10.0;
 // s_f = d(e_f)/dt + lambda_f * e_f
 // u_smc = -K_f * sat(s_f / phi)
 constexpr double kLambdaF = 20.0;
-constexpr double kSmcGainF = 5.0;
+constexpr double kSmcGainF = 2.0;
 constexpr double kBoundaryLayerPhi = 50.0;
 
 // Desired admittance parameters.
@@ -54,7 +54,7 @@ constexpr double kBoundaryLayerPhi = 50.0;
 //     = F_d - F_e + u_smc
 constexpr double kMd = 1.0;
 constexpr double kBd = 200.0;
-constexpr double kKd = 50.0;
+constexpr double kKd = 0;//5
 
 // Change this to -1.0 if the measured contact force has the opposite sign.
 constexpr double kForceSignZ = 1.0;
